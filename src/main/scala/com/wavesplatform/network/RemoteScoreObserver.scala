@@ -16,62 +16,41 @@ import scala.concurrent.duration.FiniteDuration
 class RemoteScoreObserver(scoreTtl: FiniteDuration, lastSignatures: => Seq[ByteStr], initialLocalScore: BigInt)
   extends ChannelDuplexHandler with ScorexLogging {
 
-  private val pinnedChannel = new AtomicReference[Channel]()
+  private val pinnedChannel = new AtomicReference[(Channel, BigInt)]()
 
   @volatile
   private var localScore = initialLocalScore
 
   private val scores = new ConcurrentHashMap[Channel, BigInt]
 
-  private def channelWithHighestScore =
+  private def channelWithHighestScore: Option[(Channel, BigInt)] =
     Option(scores.reduceEntries(1000, (c1, c2) => if (c1.getValue > c2.getValue) c1 else c2))
       .map(e => e.getKey -> e.getValue)
 
-  override def handlerAdded(ctx: ChannelHandlerContext): Unit =
-    ctx.channel().closeFuture().addListener { f: ChannelFuture =>
-      for ((bestChannel, _) <- channelWithHighestScore) {
-        // having no channel with highest score means scores map is empty, so it's ok to attempt to remove this channel
-        // from the map only when there is one.
-        Option(scores.remove(ctx.channel())).foreach(removedScore => log.debug(s"${id(ctx)} Closed, removing score $removedScore"))
-        if (bestChannel == f.channel()) {
-          // this channel had the highest score, so we should request extension from second-best channel, just in case
-          channelWithHighestScore match {
-            case Some((secondBestChannel, secondBestScore))
-              if secondBestScore > localScore && pinnedChannel.compareAndSet(bestChannel, secondBestChannel) =>
-              log.debug(s"${id(ctx)} Switching to second best channel $pinnedChannelId")
-              secondBestChannel.writeAndFlush(LoadBlockchainExtension(lastSignatures))
-            case _ =>
-              if (pinnedChannel.compareAndSet(f.channel(), null)) log.debug(s"${id(ctx)} Unpinning unconditionally")
-          }
-        } else {
-          if (pinnedChannel.compareAndSet(ctx.channel(), null))
-            log.debug(s"${id(ctx)} ${pinnedChannelId}Closing channel and unpinning")
-        }
+  override def handlerAdded(ctx: ChannelHandlerContext): Unit = {
+    ctx.channel().closeFuture().addListener { channelFuture: ChannelFuture =>
+      val closedChannel = channelFuture.channel()
+      resetPinnedChannel(closedChannel, "channel was closed")
+      Option(scores.remove(closedChannel)).foreach { removedScore =>
+        log.debug(s"${id(ctx)} Closed, removing score $removedScore")
       }
+
+      changePinnedChannel1(closedChannel, "switching to second best channel")
     }
+  }
 
   override def write(ctx: ChannelHandlerContext, msg: AnyRef, promise: ChannelPromise): Unit = msg match {
     case LocalScoreChanged(newLocalScore) =>
-      if (pinnedChannel.compareAndSet(ctx.channel(), null)) { // Fork applied
-        log.debug(s"${id(ctx)} ${pinnedChannelId}New local score: $newLocalScore")
-      }
       // unconditionally update local score value and propagate this message downstream
       localScore = newLocalScore
-      ctx.write(msg, promise)
-
-      // if this is the channel with the highest score and its score is higher than local, request extension
-      for ((chan, score) <- channelWithHighestScore if chan == ctx.channel() && score > newLocalScore) {
-        log.debug(s"${id(ctx)} ${pinnedChannelId}Pinning this channel")
-        pinnedChannel.set(chan)
-        chan.writeAndFlush(LoadBlockchainExtension(lastSignatures))
-      }
+      ctx.writeAndFlush(msg, promise)
+      refreshPinnedChannel("local score was updated")
 
     case _ => ctx.write(msg, promise)
   }
 
   override def channelRead(ctx: ChannelHandlerContext, msg: AnyRef): Unit = msg match {
     case newScore: History.BlockchainScore =>
-
       ctx.executor().schedule(scoreTtl) {
         if (scores.remove(ctx.channel(), newScore)) {
           log.trace(s"${id(ctx)} Score expired, removing $newScore")
@@ -83,26 +62,16 @@ class RemoteScoreObserver(scoreTtl: FiniteDuration, lastSignatures: => Seq[ByteS
         log.trace(s"${id(ctx)} ${pinnedChannelId}New score: $newScore")
       }
 
-      for {
-        (ch, highScore) <- channelWithHighestScore
-        if ch == ctx.channel() && // this is the channel with highest score
-          (previousScore == null || previousScore < newScore) && // score has increased
-          highScore > localScore // remote score is higher than local
-      } if (pinnedChannel.compareAndSet(null, ch)) {
-        // we've finished to download blocks from previous high score channel
-        log.debug(s"${id(ctx)} ${pinnedChannelId}New high score $highScore > $localScore, requesting extension")
-        ctx.writeAndFlush(LoadBlockchainExtension(lastSignatures))
-      } else {
-        log.trace(s"${id(ctx)} New high score $highScore")
+      refreshPinnedChannel("").foreach { case (newChannel, newBestScore) =>
+        log.debug(s"${id(ctx)} ${pinnedChannelId}New high score $newBestScore > $localScore, requesting extension")
+        newChannel.writeAndFlush(LoadBlockchainExtension(lastSignatures))
       }
 
-    case ExtensionBlocks(blocks) if pinnedChannel.get() == ctx.channel() =>
-      if (blocks.nonEmpty) {
+    case ExtensionBlocks(blocks) if pinnedChannel.get()._1 == ctx.channel() =>
+      if (blocks.isEmpty) resetPinnedChannel(ctx.channel(), "Blockchain is up to date")
+      else {
         log.debug(s"${id(ctx)} ${pinnedChannelId}Receiving extension blocks ${formatBlocks(blocks)}")
         super.channelRead(ctx, msg)
-      } else {
-        log.debug(s"${id(ctx)} ${pinnedChannelId}Blockchain is up to date")
-        pinnedChannel.compareAndSet(ctx.channel(), null)
       }
 
     case ExtensionBlocks(blocks) =>
@@ -112,4 +81,47 @@ class RemoteScoreObserver(scoreTtl: FiniteDuration, lastSignatures: => Seq[ByteS
   }
 
   private def pinnedChannelId = Option(pinnedChannel.get()).fold("")(ch => s"${id(ch, "pinned: ")} ")
+
+  private def resetPinnedChannel(fromExpected: Channel, reason: String): Boolean = changePinnedChannel(fromExpected, null, reason)
+
+  private def refreshPinnedChannel(reason: String): Option[(Channel, BigInt)] = {
+    channelWithHighestScore.flatMap(changePinnedChannel(_, reason))
+  }
+
+  private def changePinnedChannel(to: (Channel, BigInt), reason: String): Option[(Channel, BigInt)] = {
+    import to.{_2 => newScore}
+    val r: (Channel, BigInt) = pinnedChannel.updateAndGet {
+      case (_, currentScore) if newScore > currentScore && newScore > localScore => to
+      case orig => orig
+    }
+
+    if (r == to) {
+      val toId = Option(r._1).map(id(_))
+      log.debug(s"A new pinned channel $toId has score $newScore: $reason")
+      Some(r)
+    } else {
+      log.trace(s"Pinned channel was not changed")
+      None
+    }
+  }
+
+  private def changePinnedChannel1(fromExpectedChannel: Channel, reason: String): Boolean = {
+    channelWithHighestScore.exists { x =>
+      import x.{_2 => newScore}
+      val r: (Channel, BigInt) = pinnedChannel.updateAndGet {
+        case (`fromExpectedChannel`, _) => x
+        case orig => orig
+      }
+
+      val changed = r == x
+      if (changed) {
+        val toId = Option(r._1).map(id(_))
+        log.debug(s"A new pinned channel $toId has score $newScore: $reason")
+      } else {
+        log.trace(s"Pinned channel was not changed")
+      }
+      changed
+    }
+  }
+
 }
